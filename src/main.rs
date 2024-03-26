@@ -50,6 +50,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let provider = Provider::<Http>::try_from("https://babel-api.mainnet.iotex.io")?;
     let wallet = opt.private_key.parse::<LocalWallet>()?.with_chain_id(4689u64);
     let provider = Arc::new(SignerMiddleware::new(provider, wallet));
+
     println!("🏅 Success init wallet");
 
     let contract_address: Address = opt.contract_address.parse()?;
@@ -62,6 +63,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let (result_tx, mut result_rx) = mpsc::channel::<U256>(opt.worker_count); // Adjust buffer size as needed
     let hash_counter = Arc::new(AtomicUsize::new(0));
+    let active_workers = Arc::new(AtomicUsize::new(0));
 
     println!("🏆 Challenge: {}", challenge);
     println!("⛰️  Difficulty: {}", difficulty);
@@ -75,23 +77,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut worker_handles: Vec<JoinHandle<()>> = Vec::new();
 
-    for _ in 0..opt.worker_count {
-        let counter = hash_counter.clone();
-        let sender = result_tx.clone();
-        let addr = provider.signer().address();
-
-        let handle = tokio::spawn(async move {
-            let result = tokio::task::spawn_blocking(move || {
-                return mine_worker(addr, challenge, difficulty, counter);
-            })
-            .await
-            .unwrap();
-
-            sender.send(result).await.unwrap();
-        });
-
-        worker_handles.push(handle);
-    }
 
     let speed_bar = ProgressBar::new(100);
     speed_bar.set_style(
@@ -104,47 +89,93 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 
     loop {
+        for _ in 0..opt.worker_count {
+            if active_workers.load(Ordering::SeqCst) >= opt.worker_count {
+            // 启动新的工作线程的逻辑...
+                break;
+            }
+
+            active_workers.fetch_add(1, Ordering::SeqCst);
+
+            let active_workers_clone = active_workers.clone();
+
+            let counter = hash_counter.clone();
+            let sender = result_tx.clone();
+            let addr = provider.signer().address();
+
+            let handle = tokio::spawn(async move {
+                let result = tokio::task::spawn_blocking(move || {
+                    return mine_worker(addr, challenge, difficulty, counter);
+                })
+                    .await
+                    .unwrap();
+
+                sender.send(result).await.unwrap();
+
+                active_workers_clone.fetch_sub(1, Ordering::SeqCst);
+            });
+
+            worker_handles.push(handle);
+        }
+
 
         tokio::select! {
             _ = interval.tick()=>{
                 let total_hash_count = counter_for_timer.swap(0, Ordering::SeqCst);
                 let hashes_per_second = total_hash_count as f64 / 1000.0;
                 speed_bar.set_message(format!("Hash per second: {:.2} K/s", hashes_per_second));
+
+                let contract = contract.clone();
+                let addr = provider.signer().address();
+                let mint_times: U256 = match contract.mining_times(addr).call().await {
+                    Ok(mint_times) => mint_times,
+                    Err(e) => {
+                        eprintln!("Error calling mining_times: {:?}", e);
+                        U256::from(0)
+                        //std::process::exit(1); // Exit with error code
+                    },
+                };
+                //println!("mint_times: {}", mint_times);
+                if mint_times >= U256::from(100) {
+                    println!("already minted 100 times, exit process");
+                    std::process::exit(0);
+                }
             },
             nonce = result_rx.recv() => {
                 if let Some(nonce) = nonce {
                     println!("✅ Find the nonce: {}", nonce);
                     let contract = contract.clone();
-                    let addr = provider.signer().address();
 
                     tokio::spawn(async move{
 
-                        let gas_price = ethers::core::types::U256::from(1_010_000_000_000u64);
-                        let call = contract.mine(nonce, referal).gas_price(gas_price);
-                        let result = call.send().await;
-                        match result {
-                            Ok(tx) => match tx.await {
-                                Ok(Some(receipt)) => {
-                                    println!("Transaction successful with hash: {:?}", receipt.transaction_hash);
-                                },
-                                Ok(None) => eprintln!("Transaction might have been dropped or replaced"),
-                                Err(e) => eprintln!("Transaction execution error: {:?}", e),
-                            },
-                            Err(e) => eprintln!("Transaction send error: {:?}", e),
-                        }
+                        loop {
+                            /*
+                            let current_nonce = provider.get_transaction_count(wallet.address(), None).await?;
 
-                        let mint_times: U256 = match contract.mining_times(addr).call().await {
-                            Ok(mint_times) => mint_times,
-                            Err(e) => {
-                                eprintln!("Error calling mining_times: {:?}", e);
-                                U256::from(0)
-                                //std::process::exit(1); // Exit with error code
-                            },
-                        };
-                        println!("mint_times: {}", mint_times);
-                        if mint_times >= U256::from(25) {
-                            println!("already minted 100 times, exit process");
-                            std::process::exit(0);
+                            let current_nonce: U256 = match provider.get_transaction_count(wallet.address(), None).await {
+                                Ok(current_nonce) => current_nonce,
+                                Err(e) => {
+                                    eprintln!("Error calling mining_times: {:?}", e);
+                                    U256::from(0)
+                                    //std::process::exit(1); // Exit with error code
+                                },
+                            };
+                             */
+
+                            let gas_price = ethers::core::types::U256::from(1_010_000_000_000u64);
+                            let call = contract.mine(nonce, referal).gas_price(gas_price);
+                            let result = call.send().await;
+                            match result {
+                                Ok(tx) => match tx.await {
+                                    Ok(Some(receipt)) => {
+                                        println!("Transaction successful with hash: {:?}", receipt.transaction_hash);
+                                        break;
+                                    },
+                                    Ok(None) => eprintln!("Transaction might have been dropped or replaced"),
+                                    Err(e) => eprintln!("Transaction execution error: {:?}", e),
+                                },
+                                Err(e) => eprintln!("Transaction send error: {:?}", e),
+                            }
                         }
 
                     });
