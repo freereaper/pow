@@ -1,9 +1,10 @@
-use colored::Colorize;
+//use colored::Colorize;
 use indicatif::{ProgressBar, ProgressStyle};
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc,
 };
+
 
 use ethers::{core::rand::Rng, prelude::*, utils::keccak256};
 use structopt::StructOpt;
@@ -16,9 +17,10 @@ use tokio::{
 abigen!(
     IPOW,
     r#"[
-        function mine(uint256 nonce) external
+        function mine(uint256 nonce, address referal) external
         function challenge() external view returns (uint256)
         function difficulty() external view returns (uint256)
+        function miningTimes(address account) external view returns (uint256)
         function balanceOf(address account) external view returns (uint256)
     ]"#,
 );
@@ -28,43 +30,32 @@ struct Opt {
     #[structopt(long)]
     private_key: String,
 
-    #[structopt(long)]
+    #[structopt(long, default_value = "0xe5F8dBf17c9eC8eb327D191dBA74e36970877587")]
     contract_address: String,
 
-    #[structopt(long, default_value = "10")]
+    #[structopt(long, default_value = "0xd5A65A20c8071b8fF0Bce2b8F3a4686312b0cB49")]
+    referal_address: String,
+
+    #[structopt(long, default_value = "5")]
     worker_count: usize,
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let opt = Opt::from_args();
-    let banner = r#"
-//  ____    __        _______ ____   ____ ____   ___    __  __ _                 
-// |  _ \ __\ \      / / ____|  _ \ / ___|___ \ / _ \  |  \/  (_)_ __   ___ _ __ 
-// | |_) / _ \ \ /\ / /|  _| | |_) | |     __) | | | | | |\/| | | '_ \ / _ \ '__|
-// |  __/ (_) \ V  V / | |___|  _ <| |___ / __/| |_| | | |  | | | | | |  __/ |   
-// |_|   \___/ \_/\_/  |_____|_| \_\\____|_____|\___/  |_|  |_|_|_| |_|\___|_|   
-    "#;
 
-    println!("{}", banner.cyan());
-    let twitter_handle = "@BoxMrChen";
-    let github_url = "https://github.com/nishuzumi";
 
-    let personal_info = format!(
-        "🐦 Twitter: {}\n🐙 GitHub: {}",
-        twitter_handle.blue(),
-        github_url.yellow()
-    );
+    println!("Robot AI Miner");
 
-    println!("{}", personal_info);
-
-    let provider = Provider::<Http>::try_from("https://rpc.ankr.com/eth")?;
-    let wallet = opt.private_key.parse::<LocalWallet>()?;
+    let provider = Provider::<Http>::try_from("https://babel-api.mainnet.iotex.io")?;
+    let wallet = opt.private_key.parse::<LocalWallet>()?.with_chain_id(4689u64);
     let provider = Arc::new(SignerMiddleware::new(provider, wallet));
     println!("🏅 Success init wallet");
 
     let contract_address: Address = opt.contract_address.parse()?;
     let contract = Arc::new(IPOW::new(contract_address, provider.clone()));
+
+    let referal: Address = opt.referal_address.parse()?;
 
     let challenge: U256 = contract.challenge().call().await?;
     let difficulty: U256 = contract.difficulty().call().await?;
@@ -77,6 +68,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let difficulty = U256::from(1) << (U256::from(256) - difficulty);
     println!("🎯 Target: {}", difficulty);
+
 
     let counter_for_timer = hash_counter.clone();
     let mut interval = interval(Duration::from_secs(1));
@@ -110,7 +102,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     speed_bar.set_prefix("🚄 Speed");
 
+
     loop {
+
         tokio::select! {
             _ = interval.tick()=>{
                 let total_hash_count = counter_for_timer.swap(0, Ordering::SeqCst);
@@ -121,20 +115,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if let Some(nonce) = nonce {
                     println!("✅ Find the nonce: {}", nonce);
                     let contract = contract.clone();
+                    let addr = provider.signer().address();
+
                     tokio::spawn(async move{
-                        let result = contract.mine(nonce).send().await.unwrap().await.unwrap();
+
+                        let gas_price = ethers::core::types::U256::from(1_010_000_000_000u64);
+                        let call = contract.mine(nonce, referal).gas_price(gas_price);
+                        let result = call.send().await;
                         match result {
-                            Some(tx) => {
-                                println!("🙆 Successfully mined a block: {:?}", tx.transaction_hash)
-                            }
-                            None => {
-                                println!("⚠️ Failed to mine a block");
-                            }
+                            Ok(tx) => match tx.await {
+                                Ok(Some(receipt)) => {
+                                    println!("Transaction successful with hash: {:?}", receipt.transaction_hash);
+                                },
+                                Ok(None) => eprintln!("Transaction might have been dropped or replaced"),
+                                Err(e) => eprintln!("Transaction execution error: {:?}", e),
+                            },
+                            Err(e) => eprintln!("Transaction send error: {:?}", e),
                         }
+
+                        let mint_times: U256 = match contract.mining_times(addr).call().await {
+                            Ok(mint_times) => mint_times,
+                            Err(e) => {
+                                eprintln!("Error calling mining_times: {:?}", e);
+                                U256::from(0)
+                                //std::process::exit(1); // Exit with error code
+                            },
+                        };
+                        println!("mint_times: {}", mint_times);
+                        if mint_times >= U256::from(25) {
+                            println!("already minted 100 times, exit process");
+                            std::process::exit(0);
+                        }
+
                     });
+
                 }
             }
         }
+
     }
 }
 
